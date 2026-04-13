@@ -12,13 +12,11 @@ from PySide6.QtGui import QAction, QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
-    QFormLayout,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QLineEdit,
     QListWidget,
     QMainWindow,
     QMessageBox,
@@ -48,60 +46,69 @@ from workers import BatchProcessWorker
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Merged UNetDC Segmenter")
+        self.setWindowTitle("UNetDC Segmenter")
         self.resize(1450, 900)
 
         self.worker: BatchProcessWorker | None = None
         self.last_out_dir: Path | None = None
         self._overlay_paths: list[Path] = []
         self._input_images: list[Path] = []
-
-        self.folder_edit = QLineEdit()
-        self.ckpt_edit = QLineEdit(DEFAULT_CHECKPOINT)
-        self.out_dir_edit = QLineEdit(DEFAULT_OUT_DIR)
+        self.folder_path = ""
+        self.out_dir_path = DEFAULT_OUT_DIR
 
         self.batch_spin = QSpinBox()
         self.batch_spin.setRange(1, 10000)
         self.batch_spin.setValue(8)
+        self.batch_spin.setToolTip("Number of images processed together in one batch.")
 
         self.threshold_spin = QDoubleSpinBox()
         self.threshold_spin.setRange(0.0, 1.0)
         self.threshold_spin.setSingleStep(0.01)
         self.threshold_spin.setDecimals(3)
         self.threshold_spin.setValue(0.3)
+        self.threshold_spin.setToolTip("Detection confidence threshold applied to predicted regions.")
 
         self.min_area_spin = QSpinBox()
         self.min_area_spin.setRange(0, 10000000)
         self.min_area_spin.setValue(1)
+        self.min_area_spin.setToolTip("Discard detections smaller than this area in pixels.")
 
         self.radius_spin = QSpinBox()
         self.radius_spin.setRange(0, 10000)
         self.radius_spin.setValue(50)
+        self.radius_spin.setToolTip("Reference radius used for downstream quantification.")
 
         self.px_per_micron_spin = QDoubleSpinBox()
         self.px_per_micron_spin.setRange(0.0, 10000.0)
         self.px_per_micron_spin.setDecimals(4)
         self.px_per_micron_spin.setSingleStep(0.1)
         self.px_per_micron_spin.setValue(0.0)
+        self.px_per_micron_spin.setToolTip("Calibration value used to convert pixels to microns.")
 
         self.save_overlays_check = QCheckBox("Save overlays")
         self.save_overlays_check.setChecked(True)
         self.excel_check = QCheckBox("Generate Excel workbook")
         self.excel_check.setChecked(True)
-        self.histogram_check = QCheckBox("Generate histogram plot")
-        self.histogram_check.setChecked(True)
 
-        self.open_folder_btn = QPushButton("Open folder")
-        self.browse_ckpt_btn = QPushButton("Checkpoint")
-        self.browse_out_btn = QPushButton("Output folder")
+        self.open_folder_btn = QPushButton("Browse...")
+        self.browse_out_btn = QPushButton("Browse...")
+        self.clear_log_btn = QPushButton("Clear log")
+        self.clear_overlays_btn = QPushButton("Clear overlays")
         self.run_btn = QPushButton("Run")
-        self.open_output_btn = QPushButton("Open output folder")
+        self.run_btn.setDefault(True)
+        self.run_btn.setMinimumHeight(40)
+        self.open_output_btn = QPushButton("Open results")
         self.open_output_btn.setEnabled(False)
+        self.open_output_btn.setMinimumHeight(36)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setVisible(False)
+
+        self.status_label = QLabel("Select an input folder and output location, then run the pipeline.")
+        self.status_label.setWordWrap(True)
+        self.status_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
 
         self.original_panel = ImagePanel("Original preview")
         self.mask_panel = ImagePanel("Segmentation result")
@@ -125,9 +132,6 @@ class MainWindow(QMainWindow):
         self.summary_message.setAlignment(Qt.AlignCenter)
         self.summary_message.setWordWrap(True)
 
-        self.histogram_label = ImagePanel("Histogram preview will appear after a successful run.")
-        self.histogram_label.setMinimumSize(320, 220)
-
         self.overlay_list = QListWidget()
         self.overlay_list.setMinimumWidth(180)
         self.overlay_list.setEnabled(False)
@@ -148,37 +152,34 @@ class MainWindow(QMainWindow):
         controls_group = QGroupBox("Controls")
         controls_layout = QGridLayout()
         controls_layout.setContentsMargins(8, 8, 8, 8)
-        controls_layout.setHorizontalSpacing(10)
-        controls_layout.setVerticalSpacing(6)
-
+        controls_layout.setHorizontalSpacing(8)
+        controls_layout.setVerticalSpacing(8)
         controls_layout.addWidget(QLabel("Folder"), 0, 0)
-        controls_layout.addWidget(self._build_path_row(self.folder_edit, self.open_folder_btn), 0, 1, 1, 5)
-        controls_layout.addWidget(QLabel("Checkpoint"), 0, 6)
-        controls_layout.addWidget(self._build_path_row(self.ckpt_edit, self.browse_ckpt_btn), 0, 7, 1, 3)
-        controls_layout.addWidget(QLabel("Output"), 0, 10)
-        controls_layout.addWidget(self._build_path_row(self.out_dir_edit, self.browse_out_btn), 0, 11, 1, 3)
+        controls_layout.addWidget(self.open_folder_btn, 0, 1)
+        controls_layout.addWidget(QLabel("Output"), 0, 2)
+        controls_layout.addWidget(self.browse_out_btn, 0, 3)
 
         controls_layout.addWidget(QLabel("Batch"), 1, 0)
         controls_layout.addWidget(self.batch_spin, 1, 1)
-        controls_layout.addWidget(QLabel("Thresh"), 1, 2)
+        controls_layout.addWidget(QLabel("Threshold"), 1, 2)
         controls_layout.addWidget(self.threshold_spin, 1, 3)
         controls_layout.addWidget(QLabel("Min area"), 1, 4)
         controls_layout.addWidget(self.min_area_spin, 1, 5)
         controls_layout.addWidget(QLabel("Radius"), 1, 6)
         controls_layout.addWidget(self.radius_spin, 1, 7)
-        controls_layout.addWidget(QLabel("Px/um"), 1, 8)
+        controls_layout.addWidget(QLabel("Pixel size (px/um)"), 1, 8)
         controls_layout.addWidget(self.px_per_micron_spin, 1, 9)
         controls_layout.addWidget(self.save_overlays_check, 1, 10)
         controls_layout.addWidget(self.excel_check, 1, 11)
-        controls_layout.addWidget(self.histogram_check, 1, 12)
-        controls_layout.addWidget(self.progress_bar, 1, 13)
-        controls_layout.addWidget(self.run_btn, 1, 14)
-        controls_layout.addWidget(self.open_output_btn, 1, 15)
+        controls_layout.addWidget(self.clear_log_btn, 1, 12)
+        controls_layout.addWidget(self.clear_overlays_btn, 1, 13)
+        controls_layout.addWidget(self.progress_bar, 1, 14)
+        controls_layout.addWidget(self.run_btn, 1, 15)
+        controls_layout.addWidget(self.open_output_btn, 1, 16)
 
-        controls_layout.setColumnStretch(1, 3)
-        controls_layout.setColumnStretch(7, 2)
-        controls_layout.setColumnStretch(11, 2)
-        controls_layout.setColumnStretch(13, 1)
+        controls_layout.addWidget(self.status_label, 2, 0, 1, 17)
+        controls_layout.setColumnStretch(9, 2)
+        controls_layout.setColumnStretch(14, 1)
         controls_group.setLayout(controls_layout)
 
         browser_widget = QWidget()
@@ -230,14 +231,6 @@ class MainWindow(QMainWindow):
         droplets_layout.addWidget(self.droplets_table)
         self.tabs.addTab(droplets_widget, "Droplets")
 
-        hist_scroll = QScrollArea()
-        hist_scroll.setWidgetResizable(True)
-        hist_widget = QWidget()
-        hist_layout = QVBoxLayout(hist_widget)
-        hist_layout.addWidget(self.histogram_label)
-        hist_scroll.setWidget(hist_widget)
-        self.tabs.addTab(hist_scroll, "Histogram")
-
         overlay_widget = QWidget()
         overlay_layout = QHBoxLayout(overlay_widget)
         overlay_layout.addWidget(self.overlay_list)
@@ -266,9 +259,9 @@ class MainWindow(QMainWindow):
         main_splitter.addWidget(preview_group)
         main_splitter.addWidget(self.tabs)
         main_splitter.setStretchFactor(0, 0)
-        main_splitter.setStretchFactor(1, 3)
+        main_splitter.setStretchFactor(1, 4)
         main_splitter.setStretchFactor(2, 2)
-        main_splitter.setSizes([90, 420, 280])
+        main_splitter.setSizes([60, 520, 220])
 
         root.addWidget(main_splitter)
         self.setCentralWidget(central)
@@ -289,18 +282,11 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
-    def _build_path_row(self, line_edit: QLineEdit, button: QPushButton) -> QWidget:
-        container = QWidget()
-        row = QHBoxLayout(container)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.addWidget(line_edit)
-        row.addWidget(button)
-        return container
-
     def _connect_signals(self) -> None:
         self.open_folder_btn.clicked.connect(self.open_folder)
-        self.browse_ckpt_btn.clicked.connect(self.browse_checkpoint)
         self.browse_out_btn.clicked.connect(self.browse_output_dir)
+        self.clear_log_btn.clicked.connect(self.clear_log)
+        self.clear_overlays_btn.clicked.connect(self.clear_overlays)
         self.run_btn.clicked.connect(self.run_pipeline)
         self.open_output_btn.clicked.connect(self.open_output_folder)
         self.overlay_list.currentRowChanged.connect(self.on_overlay_selected)
@@ -312,11 +298,12 @@ class MainWindow(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, "Select image folder")
         if not path:
             return
-        self.folder_edit.setText(path)
+        self.folder_path = path
         folder = Path(path)
         self._clear_tables_and_outputs()
         self._input_images = sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in VALID_EXTS)
         self._populate_input_list()
+        self._refresh_status_label()
         if not self._input_images:
             self._append_log_line(f"Selected folder: {path}")
             self._append_log_line("Detected images: 0")
@@ -327,15 +314,22 @@ class MainWindow(QMainWindow):
         self._append_log_line(f"Selected folder: {path}")
         self._append_log_line(f"Detected images: {len(self._input_images)}")
 
-    def browse_checkpoint(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Select checkpoint", "", "PyTorch checkpoint (*.pth *.pt)")
-        if path:
-            self.ckpt_edit.setText(path)
-
     def browse_output_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select output directory")
         if path:
-            self.out_dir_edit.setText(path)
+            self.out_dir_path = path
+            self._refresh_status_label()
+
+    def clear_log(self) -> None:
+        self.log_output.clear()
+
+    def clear_overlays(self) -> None:
+        self.overlay_list.clear()
+        self.overlay_list.setEnabled(False)
+        self.overlay_image_label.setPixmap(QPixmap())
+        self.overlay_image_label.setText("Overlay gallery cleared.")
+        self._overlay_paths = []
+        self.overlay_panel.clear_to_title("Overlay")
 
     def run_pipeline(self) -> None:
         if self.worker is not None:
@@ -343,9 +337,9 @@ class MainWindow(QMainWindow):
 
         try:
             input_path, command, out_dir = prepare_run(
-                folder_text=self.folder_edit.text(),
-                ckpt_text=self.ckpt_edit.text(),
-                out_dir_text=self.out_dir_edit.text(),
+                folder_text=self.folder_path,
+                ckpt_text=DEFAULT_CHECKPOINT,
+                out_dir_text=self.out_dir_path,
                 batch_value=int(self.batch_spin.value()),
                 threshold_value=float(self.threshold_spin.value()),
                 min_area_value=int(self.min_area_spin.value()),
@@ -353,7 +347,7 @@ class MainWindow(QMainWindow):
                 px_per_micron_value=float(self.px_per_micron_spin.value()),
                 save_overlays=self.save_overlays_check.isChecked(),
                 excel_enabled=self.excel_check.isChecked(),
-                histogram_enabled=self.histogram_check.isChecked(),
+                histogram_enabled=False,
             )
         except ValueError as exc:
             QMessageBox.critical(self, "Error", str(exc))
@@ -379,9 +373,6 @@ class MainWindow(QMainWindow):
 
     def _set_running(self, running: bool) -> None:
         widgets = (
-            self.folder_edit,
-            self.ckpt_edit,
-            self.out_dir_edit,
             self.batch_spin,
             self.threshold_spin,
             self.min_area_spin,
@@ -389,9 +380,7 @@ class MainWindow(QMainWindow):
             self.px_per_micron_spin,
             self.save_overlays_check,
             self.excel_check,
-            self.histogram_check,
             self.open_folder_btn,
-            self.browse_ckpt_btn,
             self.browse_out_btn,
         )
         for widget in widgets:
@@ -400,9 +389,14 @@ class MainWindow(QMainWindow):
             self.input_list.setEnabled(False)
             self.prev_image_btn.setEnabled(False)
             self.next_image_btn.setEnabled(False)
+            self.status_label.setText("Processing images. Progress details will appear in the log tab.")
         else:
             self.input_list.setEnabled(bool(self._input_images))
             self._update_navigation_buttons()
+            if self.last_out_dir is not None and self.last_out_dir.exists():
+                self.status_label.setText(f"Ready. Latest results are available in:\n{self.last_out_dir}")
+            else:
+                self.status_label.setText("Select an input folder and output location, then run the pipeline.")
         self.run_btn.setEnabled(not running)
         self.progress_bar.setVisible(running)
         self.open_output_btn.setEnabled((not running) and self.last_out_dir is not None and self.last_out_dir.exists())
@@ -421,9 +415,9 @@ class MainWindow(QMainWindow):
         self._append_log_line("Finished successfully.")
         self._populate_summary(result.summary_rows, result.stats_rows)
         self._populate_droplets(result.droplet_rows)
-        self._load_histogram(result.histogram_path)
         self._load_overlay_gallery(Path(result.out_dir))
         self._load_result_previews(Path(result.out_dir))
+        self.status_label.setText(f"Processing complete. Results saved to:\n{result.out_dir}")
 
         self.open_output_btn.setEnabled(True)
         self.tabs.setCurrentWidget(self.summary_tab)
@@ -434,6 +428,7 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def on_run_failed(self, message: str) -> None:
         self.log_output.appendPlainText("ERROR: " + message)
+        self.status_label.setText("Run failed. Check the log tab for details and adjust the settings if needed.")
         QMessageBox.critical(self, "Error", message)
 
     def _clear_tables_and_outputs(self) -> None:
@@ -441,7 +436,6 @@ class MainWindow(QMainWindow):
         self._reset_table(self.stats_table)
         self._reset_table(self.droplets_table)
         self.summary_message.setText("Run the pipeline to see summary tables.")
-        self.histogram_label.clear_to_title("Histogram preview will appear after a successful run.")
         self.overlay_list.clear()
         self.overlay_list.setEnabled(False)
         self.overlay_image_label.setPixmap(QPixmap())
@@ -470,15 +464,10 @@ class MainWindow(QMainWindow):
         headers = list(droplet_rows[0].keys())
         self._populate_table(self.droplets_table, headers, droplet_rows)
 
-    def _load_histogram(self, histogram_path: str | None) -> None:
-        if not histogram_path:
-            self.histogram_label.clear_to_title("Histogram not generated.")
-            return
-        pixmap = QPixmap(histogram_path)
-        if pixmap.isNull():
-            self.histogram_label.clear_to_title("Histogram image could not be loaded.")
-            return
-        self.histogram_label.set_scaled_pixmap(pixmap)
+    def _refresh_status_label(self) -> None:
+        folder_text = self.folder_path if self.folder_path else "No folder selected"
+        output_text = self.out_dir_path if self.out_dir_path else "No output folder selected"
+        self.status_label.setText(f"Folder: {folder_text}\nOutput: {output_text}")
 
     def _load_overlay_gallery(self, out_dir: Path) -> None:
         overlay_dir = out_dir / "overlays"
