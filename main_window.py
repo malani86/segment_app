@@ -1,19 +1,14 @@
-
-
-
-
 from __future__ import annotations
 
+import shutil
 import shlex
 from pathlib import Path
 
 from PySide6.QtCore import QUrl, Qt, Slot
-from PySide6.QtGui import QAction, QDesktopServices, QPixmap
+from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
-    QCheckBox,
+    QFrame,
     QFileDialog,
-    QGridLayout,
-    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -22,11 +17,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
-    QProgressBar,
-    QScrollArea,
-    QSizePolicy,
-    QSpinBox,
-    QDoubleSpinBox,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -35,11 +25,25 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from backend import prepare_run
-from config import DEFAULT_CHECKPOINT, DEFAULT_OUT_DIR, VALID_EXTS
-from imaging import image_file_to_qpixmap, load_preview_bundle, numpy_image_to_qpixmap
-from app_models import BatchRunResult
-from widgets import ImagePanel
+from app_models import (
+    BatchRunResult,
+    INPUT_MODE_BATCH,
+    INPUT_MODE_SINGLE,
+    STACK_VIEW_PROJECTION,
+    STACK_VIEW_SLICE,
+    TIFF_MODE_ALL_SLICES,
+    TIFF_MODE_CURRENT_SLICE,
+    TIFF_MODE_MAX_PROJECTION,
+    VIEWER_MODE_OVERLAY,
+    WORKFLOW_STEP_EXPORT,
+    WORKFLOW_STEP_LOAD,
+    WORKFLOW_STEP_PREVIEW,
+    WORKFLOW_STEP_QUANTIFY,
+    WORKFLOW_STEP_SEGMENT,
+)
+from controller import SegmentAppController
+from preview_service import PreviewResultService, ViewerDisplayData
+from widgets import InspectionViewer, SettingsDialog
 from workers import BatchProcessWorker
 
 
@@ -49,77 +53,15 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("UNetDC Segmenter")
         self.resize(1450, 900)
 
+        self.controller = SegmentAppController()
+        self.preview_service = PreviewResultService()
         self.worker: BatchProcessWorker | None = None
-        self.last_out_dir: Path | None = None
-        self._overlay_paths: list[Path] = []
-        self._input_images: list[Path] = []
-        self.folder_path = ""
-        self.out_dir_path = DEFAULT_OUT_DIR
+        self._pending_temp_input_dir: Path | None = None
 
-        self.batch_spin = QSpinBox()
-        self.batch_spin.setRange(1, 10000)
-        self.batch_spin.setValue(8)
-        self.batch_spin.setToolTip("Number of images processed together in one batch.")
-
-        self.threshold_spin = QDoubleSpinBox()
-        self.threshold_spin.setRange(0.0, 1.0)
-        self.threshold_spin.setSingleStep(0.01)
-        self.threshold_spin.setDecimals(3)
-        self.threshold_spin.setValue(0.3)
-        self.threshold_spin.setToolTip("Detection confidence threshold applied to predicted regions.")
-
-        self.min_area_spin = QSpinBox()
-        self.min_area_spin.setRange(0, 10000000)
-        self.min_area_spin.setValue(1)
-        self.min_area_spin.setToolTip("Discard detections smaller than this area in pixels.")
-
-        self.radius_spin = QSpinBox()
-        self.radius_spin.setRange(0, 10000)
-        self.radius_spin.setValue(50)
-        self.radius_spin.setToolTip("Reference radius used for downstream quantification.")
-
-        self.px_per_micron_spin = QDoubleSpinBox()
-        self.px_per_micron_spin.setRange(0.0, 10000.0)
-        self.px_per_micron_spin.setDecimals(4)
-        self.px_per_micron_spin.setSingleStep(0.1)
-        self.px_per_micron_spin.setValue(0.0)
-        self.px_per_micron_spin.setToolTip("Calibration value used to convert pixels to microns.")
-
-        self.save_overlays_check = QCheckBox("Save overlays")
-        self.save_overlays_check.setChecked(True)
-        self.excel_check = QCheckBox("Generate Excel workbook")
-        self.excel_check.setChecked(True)
-
-        self.open_folder_btn = QPushButton("Browse...")
-        self.browse_out_btn = QPushButton("Browse...")
-        self.clear_log_btn = QPushButton("Clear log")
-        self.clear_overlays_btn = QPushButton("Clear overlays")
-        self.run_btn = QPushButton("Run")
-        self.run_btn.setDefault(True)
-        self.run_btn.setMinimumHeight(40)
-        self.open_output_btn = QPushButton("Open results")
-        self.open_output_btn.setEnabled(False)
-        self.open_output_btn.setMinimumHeight(36)
-
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 0)
-        self.progress_bar.setTextVisible(False)
-        self.progress_bar.setVisible(False)
-
-        self.status_label = QLabel("Select an input folder and output location, then run the pipeline.")
-        self.status_label.setWordWrap(True)
-        self.status_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-
-        self.original_panel = ImagePanel("Original preview")
-        self.mask_panel = ImagePanel("Segmentation result")
-        self.overlay_panel = ImagePanel("Overlay")
+        self.viewer = InspectionViewer()
         self.input_list = QListWidget()
         self.input_list.setMinimumWidth(220)
         self.input_list.setEnabled(False)
-        self.prev_image_btn = QPushButton("Previous")
-        self.next_image_btn = QPushButton("Next")
-        self.prev_image_btn.setEnabled(False)
-        self.next_image_btn.setEnabled(False)
 
         self.summary_table = QTableWidget()
         self.stats_table = QTableWidget()
@@ -131,90 +73,79 @@ class MainWindow(QMainWindow):
         self.summary_message = QLabel("Run the pipeline to see summary tables.")
         self.summary_message.setAlignment(Qt.AlignCenter)
         self.summary_message.setWordWrap(True)
-
-        self.overlay_list = QListWidget()
-        self.overlay_list.setMinimumWidth(180)
-        self.overlay_list.setEnabled(False)
-        self.overlay_image_label = QLabel("Overlay gallery will appear here after a successful run.")
-        self.overlay_image_label.setAlignment(Qt.AlignCenter)
-        self.overlay_image_label.setWordWrap(True)
+        self.tiff_mode_label = QLabel()
+        self.tiff_mode_label.setWordWrap(True)
+        self.tiff_mode_label.setStyleSheet("color: #6b7280;")
 
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
+        self.log_clear_btn = QPushButton("Clear log")
 
         self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
 
         self._build_ui()
         self._connect_signals()
         self._build_menu()
+        self._set_workflow_step(WORKFLOW_STEP_LOAD)
+        self._refresh_tiff_mode_label()
 
     def _build_ui(self) -> None:
-        controls_group = QGroupBox("Controls")
-        controls_layout = QGridLayout()
-        controls_layout.setContentsMargins(8, 8, 8, 8)
-        controls_layout.setHorizontalSpacing(8)
-        controls_layout.setVerticalSpacing(8)
-        controls_layout.addWidget(QLabel("Folder"), 0, 0)
-        controls_layout.addWidget(self.open_folder_btn, 0, 1)
-        controls_layout.addWidget(QLabel("Output"), 0, 2)
-        controls_layout.addWidget(self.browse_out_btn, 0, 3)
+        sidebar_frame = QFrame()
+        sidebar_frame.setObjectName("imageSidebar")
+        sidebar_frame.setStyleSheet(
+            "#imageSidebar { border: 1px solid #e5e7eb; border-radius: 12px; background: #fbfbfc; }"
+        )
+        sidebar_frame.setMinimumWidth(210)
+        sidebar_frame.setMaximumWidth(260)
+        sidebar_layout = QVBoxLayout(sidebar_frame)
+        sidebar_layout.setContentsMargins(12, 12, 12, 12)
+        sidebar_layout.setSpacing(10)
+        sidebar_title = QLabel("Images")
+        sidebar_title.setStyleSheet("font-size: 15px; font-weight: 700; color: #1f2937;")
+        sidebar_hint = QLabel("Select an image to inspect and analyze.")
+        sidebar_hint.setWordWrap(True)
+        sidebar_hint.setStyleSheet("color: #6b7280;")
+        sidebar_layout.addWidget(sidebar_title)
+        sidebar_layout.addWidget(sidebar_hint)
+        sidebar_layout.addWidget(self.input_list, 1)
 
-        controls_layout.addWidget(QLabel("Batch"), 1, 0)
-        controls_layout.addWidget(self.batch_spin, 1, 1)
-        controls_layout.addWidget(QLabel("Threshold"), 1, 2)
-        controls_layout.addWidget(self.threshold_spin, 1, 3)
-        controls_layout.addWidget(QLabel("Min area"), 1, 4)
-        controls_layout.addWidget(self.min_area_spin, 1, 5)
-        controls_layout.addWidget(QLabel("Radius"), 1, 6)
-        controls_layout.addWidget(self.radius_spin, 1, 7)
-        controls_layout.addWidget(QLabel("Pixel size (px/um)"), 1, 8)
-        controls_layout.addWidget(self.px_per_micron_spin, 1, 9)
-        controls_layout.addWidget(self.save_overlays_check, 1, 10)
-        controls_layout.addWidget(self.excel_check, 1, 11)
-        controls_layout.addWidget(self.clear_log_btn, 1, 12)
-        controls_layout.addWidget(self.clear_overlays_btn, 1, 13)
-        controls_layout.addWidget(self.progress_bar, 1, 14)
-        controls_layout.addWidget(self.run_btn, 1, 15)
-        controls_layout.addWidget(self.open_output_btn, 1, 16)
+        viewer_frame = QFrame()
+        viewer_frame.setObjectName("viewerFrame")
+        viewer_frame.setStyleSheet(
+            "#viewerFrame { border: 1px solid #d7dbe2; border-radius: 12px; background: #ffffff; }"
+        )
+        viewer_layout = QVBoxLayout(viewer_frame)
+        viewer_layout.setContentsMargins(12, 12, 12, 12)
+        viewer_layout.setSpacing(10)
+        viewer_title = QLabel("Image Viewer")
+        viewer_title.setStyleSheet("font-size: 16px; font-weight: 700; color: #111827;")
+        viewer_subtitle = QLabel("Inspect the original image, mask, and overlay in one place.")
+        viewer_subtitle.setWordWrap(True)
+        viewer_subtitle.setStyleSheet("color: #6b7280;")
+        viewer_layout.addWidget(viewer_title)
+        viewer_layout.addWidget(viewer_subtitle)
+        viewer_layout.addWidget(self.tiff_mode_label)
+        viewer_layout.addWidget(self.viewer, 1)
 
-        controls_layout.addWidget(self.status_label, 2, 0, 1, 17)
-        controls_layout.setColumnStretch(9, 2)
-        controls_layout.setColumnStretch(14, 1)
-        controls_group.setLayout(controls_layout)
-
-        browser_widget = QWidget()
-        browser_layout = QVBoxLayout(browser_widget)
-        browser_layout.setContentsMargins(0, 0, 0, 0)
-        browser_layout.addWidget(QLabel("Input images"))
-        browser_layout.addWidget(self.input_list)
-        nav_layout = QHBoxLayout()
-        nav_layout.addWidget(self.prev_image_btn)
-        nav_layout.addWidget(self.next_image_btn)
-        browser_layout.addLayout(nav_layout)
-
-        image_splitter = QSplitter(Qt.Horizontal)
-        image_splitter.setChildrenCollapsible(False)
-        image_splitter.addWidget(self.original_panel)
-        image_splitter.addWidget(self.mask_panel)
-        image_splitter.addWidget(self.overlay_panel)
-        image_splitter.setStretchFactor(0, 1)
-        image_splitter.setStretchFactor(1, 1)
-        image_splitter.setStretchFactor(2, 1)
-        image_splitter.setSizes([120, 120, 120])
-
-        preview_splitter = QSplitter(Qt.Horizontal)
-        preview_splitter.setChildrenCollapsible(False)
-        preview_splitter.addWidget(browser_widget)
-        preview_splitter.addWidget(image_splitter)
-        preview_splitter.setStretchFactor(0, 0)
-        preview_splitter.setStretchFactor(1, 1)
-        preview_splitter.setSizes([260, 1180])
-
-        preview_group = QGroupBox("Preview")
-        preview_layout = QVBoxLayout(preview_group)
-        preview_layout.setContentsMargins(12, 12, 12, 12)
-        preview_layout.addWidget(preview_splitter)
-        preview_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        results_frame = QFrame()
+        results_frame.setObjectName("resultsFrame")
+        results_frame.setStyleSheet(
+            "#resultsFrame { border: 1px solid #d7dbe2; border-radius: 12px; background: #ffffff; }"
+        )
+        results_frame.setMinimumWidth(320)
+        results_frame.setMaximumWidth(440)
+        results_layout = QVBoxLayout(results_frame)
+        results_layout.setContentsMargins(12, 12, 12, 12)
+        results_layout.setSpacing(10)
+        results_title = QLabel("Results")
+        results_title.setStyleSheet("font-size: 16px; font-weight: 700; color: #111827;")
+        results_subtitle = QLabel("Review summary tables and processing logs.")
+        results_subtitle.setWordWrap(True)
+        results_subtitle.setStyleSheet("color: #6b7280;")
+        results_layout.addWidget(results_title)
+        results_layout.addWidget(results_subtitle)
+        results_layout.addWidget(self.tabs, 1)
 
         self.summary_tab = QWidget()
         summary_layout = QVBoxLayout(self.summary_tab)
@@ -225,144 +156,273 @@ class MainWindow(QMainWindow):
         summary_layout.addWidget(self.stats_table)
         self.tabs.addTab(self.summary_tab, "Summary")
 
-        droplets_widget = QWidget()
-        droplets_layout = QVBoxLayout(droplets_widget)
+        self.droplets_tab = QWidget()
+        droplets_layout = QVBoxLayout(self.droplets_tab)
         droplets_layout.addWidget(QLabel("Per-droplet table"))
         droplets_layout.addWidget(self.droplets_table)
-        self.tabs.addTab(droplets_widget, "Droplets")
+        self.tabs.addTab(self.droplets_tab, "Droplets")
 
-        overlay_widget = QWidget()
-        overlay_layout = QHBoxLayout(overlay_widget)
-        overlay_layout.addWidget(self.overlay_list)
-        overlay_scroll = QScrollArea()
-        overlay_scroll.setWidgetResizable(True)
-        overlay_image_container = QWidget()
-        overlay_image_layout = QVBoxLayout(overlay_image_container)
-        overlay_image_layout.addWidget(self.overlay_image_label)
-        overlay_scroll.setWidget(overlay_image_container)
-        overlay_layout.addWidget(overlay_scroll, 1)
-        self.tabs.addTab(overlay_widget, "Overlays")
-
-        log_widget = QWidget()
-        log_layout = QVBoxLayout(log_widget)
+        self.log_tab = QWidget()
+        log_layout = QVBoxLayout(self.log_tab)
+        log_toolbar = QHBoxLayout()
+        log_toolbar.addStretch(1)
+        log_toolbar.addWidget(self.log_clear_btn)
+        log_layout.addLayout(log_toolbar)
         log_layout.addWidget(self.log_output)
-        self.tabs.addTab(log_widget, "Log")
+        self.tabs.addTab(self.log_tab, "Log")
 
         central = QWidget()
         root = QVBoxLayout(central)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(12)
 
-        main_splitter = QSplitter(Qt.Vertical)
-        main_splitter.setChildrenCollapsible(False)
-        main_splitter.addWidget(controls_group)
-        main_splitter.addWidget(preview_group)
-        main_splitter.addWidget(self.tabs)
-        main_splitter.setStretchFactor(0, 0)
-        main_splitter.setStretchFactor(1, 4)
-        main_splitter.setStretchFactor(2, 2)
-        main_splitter.setSizes([60, 520, 220])
+        workspace_splitter = QSplitter(Qt.Horizontal)
+        workspace_splitter.setChildrenCollapsible(False)
+        workspace_splitter.addWidget(sidebar_frame)
+        workspace_splitter.addWidget(viewer_frame)
+        workspace_splitter.addWidget(results_frame)
+        workspace_splitter.setStretchFactor(0, 0)
+        workspace_splitter.setStretchFactor(1, 1)
+        workspace_splitter.setStretchFactor(2, 0)
+        workspace_splitter.setSizes([220, 980, 420])
 
-        root.addWidget(main_splitter)
+        root.addWidget(workspace_splitter, 1)
         self.setCentralWidget(central)
 
     def _build_menu(self) -> None:
-        file_menu = self.menuBar().addMenu("&File")
+        menu_bar = self.menuBar()
+        menu_bar.clear()
+        file_menu = menu_bar.addMenu("File")
 
-        open_folder_action = QAction("Open folder", self)
-        open_folder_action.triggered.connect(self.open_folder)
-        file_menu.addAction(open_folder_action)
+        self.open_folder_action = QAction("Open Folder", self)
+        self.open_folder_action.triggered.connect(self.open_folder)
+        file_menu.addAction(self.open_folder_action)
 
-        run_action = QAction("Run", self)
-        run_action.triggered.connect(self.run_pipeline)
-        file_menu.addAction(run_action)
+        self.open_image_action = QAction("Open Image", self)
+        self.open_image_action.triggered.connect(self.open_image)
+        file_menu.addAction(self.open_image_action)
 
         file_menu.addSeparator()
-        exit_action = QAction("Exit", self)
-        exit_action.triggered.connect(self.close)
-        file_menu.addAction(exit_action)
+
+        self.select_output_action = QAction("Select Output Folder", self)
+        self.select_output_action.triggered.connect(self.browse_output_dir)
+        file_menu.addAction(self.select_output_action)
+
+        self.open_output_action = QAction("Open Output Folder", self)
+        self.open_output_action.triggered.connect(self.open_output_folder)
+        self.open_output_action.setEnabled(False)
+        file_menu.addAction(self.open_output_action)
+
+        file_menu.addSeparator()
+
+        self.exit_action = QAction("Exit", self)
+        self.exit_action.triggered.connect(self.close)
+        file_menu.addAction(self.exit_action)
+
+        run_menu = menu_bar.addMenu("Run")
+
+        self.run_action = QAction("Run Analysis", self)
+        self.run_action.triggered.connect(self.run_pipeline)
+        run_menu.addAction(self.run_action)
+
+        navigate_menu = menu_bar.addMenu("Navigate")
+
+        self.previous_image_action = QAction("Previous Image", self)
+        self.previous_image_action.triggered.connect(self.show_previous_image)
+        self.previous_image_action.setEnabled(False)
+        navigate_menu.addAction(self.previous_image_action)
+
+        self.next_image_action = QAction("Next Image", self)
+        self.next_image_action.triggered.connect(self.show_next_image)
+        self.next_image_action.setEnabled(False)
+        navigate_menu.addAction(self.next_image_action)
+
+        tools_menu = menu_bar.addMenu("Tools")
+
+        self.settings_action = QAction("Settings", self)
+        self.settings_action.triggered.connect(self.open_settings_dialog)
+        tools_menu.addAction(self.settings_action)
+
+        help_menu = menu_bar.addMenu("Help")
+
+        self.about_action = QAction("About", self)
+        self.about_action.triggered.connect(self.show_about_dialog)
+        help_menu.addAction(self.about_action)
 
     def _connect_signals(self) -> None:
-        self.open_folder_btn.clicked.connect(self.open_folder)
-        self.browse_out_btn.clicked.connect(self.browse_output_dir)
-        self.clear_log_btn.clicked.connect(self.clear_log)
-        self.clear_overlays_btn.clicked.connect(self.clear_overlays)
-        self.run_btn.clicked.connect(self.run_pipeline)
-        self.open_output_btn.clicked.connect(self.open_output_folder)
-        self.overlay_list.currentRowChanged.connect(self.on_overlay_selected)
+        self.log_clear_btn.clicked.connect(self.clear_log)
         self.input_list.currentRowChanged.connect(self.on_input_selected)
-        self.prev_image_btn.clicked.connect(self.show_previous_image)
-        self.next_image_btn.clicked.connect(self.show_next_image)
+        self.viewer.modeChanged.connect(self._on_viewer_mode_changed)
+        self.viewer.fitModeChanged.connect(self._on_viewer_fit_mode_changed)
+        self.viewer.sliceIndexChanged.connect(self._on_viewer_slice_index_changed)
+        self.viewer.stackViewModeChanged.connect(self._on_viewer_stack_view_mode_changed)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+    @property
+    def state(self):
+        return self.controller.state
+
+    def _set_workflow_step(self, step_key: str) -> None:
+        self.state.viewer.workflow_step = step_key
+
+    @Slot(str)
+    def _on_viewer_mode_changed(self, mode: str) -> None:
+        self.state.viewer.current_mode = mode
+        self._set_workflow_step(WORKFLOW_STEP_PREVIEW)
+
+    @Slot(bool)
+    def _on_viewer_fit_mode_changed(self, enabled: bool) -> None:
+        self.state.viewer.fit_to_window = enabled
+
+    @Slot(int)
+    def _on_viewer_slice_index_changed(self, index: int) -> None:
+        self.state.viewer.current_slice_index = index
+        self._refresh_tiff_mode_label()
+        self._refresh_viewer()
+
+    @Slot(str)
+    def _on_viewer_stack_view_mode_changed(self, mode: str) -> None:
+        self.state.viewer.stack_view_mode = mode
+        self._refresh_viewer()
+
+    @Slot(int)
+    def _on_tab_changed(self, index: int) -> None:
+        if index in (0, 1):
+            self._set_workflow_step(WORKFLOW_STEP_QUANTIFY)
+        elif index == 2:
+            self._set_workflow_step(WORKFLOW_STEP_SEGMENT)
+
+    def _sync_settings_to_state(self) -> None:
+        self.controller.update_settings(
+            checkpoint_path=self.state.settings.checkpoint_path,
+            batch_size=int(self.state.settings.batch_size),
+            threshold=float(self.state.settings.threshold),
+            min_area=int(self.state.settings.min_area),
+            background_radius=int(self.state.settings.background_radius),
+            resize_size=int(self.state.settings.resize_size),
+            px_per_micron=float(self.state.settings.px_per_micron),
+            overlay_alpha=float(self.state.settings.overlay_alpha),
+            save_overlays=self.state.settings.save_overlays,
+            save_masks=self.state.settings.save_masks,
+            automatic_quantification=self.state.settings.automatic_quantification,
+            excel_enabled=self.state.settings.excel_enabled,
+            histogram_enabled=self.state.settings.histogram_enabled,
+            tiff_stack_mode=self.state.settings.tiff_stack_mode,
+        )
+
+    def open_settings_dialog(self) -> None:
+        dialog = SettingsDialog(self.state.settings, self)
+        if not dialog.exec():
+            return
+
+        updated_settings = dialog.to_settings(self.state.settings)
+        self.controller.update_settings(
+            checkpoint_path=updated_settings.checkpoint_path,
+            batch_size=updated_settings.batch_size,
+            threshold=updated_settings.threshold,
+            min_area=updated_settings.min_area,
+            background_radius=updated_settings.background_radius,
+            resize_size=updated_settings.resize_size,
+            px_per_micron=updated_settings.px_per_micron,
+            overlay_alpha=updated_settings.overlay_alpha,
+            save_overlays=updated_settings.save_overlays,
+            save_masks=updated_settings.save_masks,
+            automatic_quantification=updated_settings.automatic_quantification,
+            excel_enabled=updated_settings.excel_enabled,
+            histogram_enabled=updated_settings.histogram_enabled,
+            tiff_stack_mode=updated_settings.tiff_stack_mode,
+        )
+        self._refresh_tiff_mode_label()
+        self._append_log_line("Settings updated.")
+
+    def _describe_tiff_mode(self) -> str:
+        mode = self.state.settings.tiff_stack_mode
+        if mode == TIFF_MODE_MAX_PROJECTION:
+            return "TIFF inference mode: max projection for multi-slice TIFF stacks."
+        if mode == TIFF_MODE_ALL_SLICES:
+            return "TIFF inference mode: all slices for multi-slice TIFF stacks."
+        return f"TIFF inference mode: current slice ({self.state.viewer.current_slice_index + 1}) for multi-slice TIFF stacks."
+
+    def _refresh_tiff_mode_label(self) -> None:
+        suffix = ""
+        if self.state.viewer.is_stack:
+            suffix = f" Viewing {self.state.viewer.available_slices} slice(s) in the selected stack."
+        self.tiff_mode_label.setText(self._describe_tiff_mode() + suffix)
+
+    def show_about_dialog(self) -> None:
+        QMessageBox.about(
+            self,
+            "About segment_app",
+            "segment_app\n\nA microscopy image analysis GUI for previewing, segmenting, and reviewing results.",
+        )
 
     def open_folder(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select image folder")
         if not path:
             return
-        self.folder_path = path
-        folder = Path(path)
         self._clear_tables_and_outputs()
-        self._input_images = sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in VALID_EXTS)
+        self.controller.set_input_dir(path)
         self._populate_input_list()
-        self._refresh_status_label()
-        if not self._input_images:
+        self._set_workflow_step(WORKFLOW_STEP_LOAD)
+        self._refresh_tiff_mode_label()
+        if not self.state.session.input_images:
             self._append_log_line(f"Selected folder: {path}")
             self._append_log_line("Detected images: 0")
-            self.original_panel.clear_to_title("Original preview")
+            self.viewer.clear("Select an image to inspect.")
             return
 
         self.input_list.setCurrentRow(0)
         self._append_log_line(f"Selected folder: {path}")
-        self._append_log_line(f"Detected images: {len(self._input_images)}")
+        self._append_log_line(f"Detected images: {len(self.state.session.input_images)}")
+
+    def open_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select image",
+            "",
+            "Images (*.png *.jpg *.jpeg *.tif *.tiff)",
+        )
+        if not path:
+            return
+        self._clear_tables_and_outputs()
+        self.controller.set_input_file(path)
+        self._populate_input_list()
+        self._set_workflow_step(WORKFLOW_STEP_LOAD)
+        self._refresh_tiff_mode_label()
+        self.input_list.setCurrentRow(0)
+        self._append_log_line(f"Selected image: {path}")
 
     def browse_output_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select output directory")
         if path:
-            self.out_dir_path = path
-            self._refresh_status_label()
+            self.controller.set_output_dir(path)
 
     def clear_log(self) -> None:
         self.log_output.clear()
-
-    def clear_overlays(self) -> None:
-        self.overlay_list.clear()
-        self.overlay_list.setEnabled(False)
-        self.overlay_image_label.setPixmap(QPixmap())
-        self.overlay_image_label.setText("Overlay gallery cleared.")
-        self._overlay_paths = []
-        self.overlay_panel.clear_to_title("Overlay")
 
     def run_pipeline(self) -> None:
         if self.worker is not None:
             return
 
+        self._sync_settings_to_state()
         try:
-            input_path, command, out_dir = prepare_run(
-                folder_text=self.folder_path,
-                ckpt_text=DEFAULT_CHECKPOINT,
-                out_dir_text=self.out_dir_path,
-                batch_value=int(self.batch_spin.value()),
-                threshold_value=float(self.threshold_spin.value()),
-                min_area_value=int(self.min_area_spin.value()),
-                radius_value=int(self.radius_spin.value()),
-                px_per_micron_value=float(self.px_per_micron_spin.value()),
-                save_overlays=self.save_overlays_check.isChecked(),
-                excel_enabled=self.excel_check.isChecked(),
-                histogram_enabled=False,
-            )
+            run_request = self.controller.build_run_request()
         except ValueError as exc:
             QMessageBox.critical(self, "Error", str(exc))
             return
 
         self.log_output.clear()
-        self._append_log_line("Running: " + " ".join(shlex.quote(a) for a in command))
+        self._append_log_line("Running: " + " ".join(shlex.quote(a) for a in run_request.command))
+        self._set_workflow_step(WORKFLOW_STEP_SEGMENT)
         self._set_running(True)
         self._clear_tables_and_outputs()
-        self.last_out_dir = out_dir
+        self.controller.set_last_out_dir(run_request.out_dir)
+        self._pending_temp_input_dir = run_request.temp_input_dir
 
         self.worker = BatchProcessWorker(
-            input_path=input_path,
-            command=command,
-            out_dir=out_dir,
+            input_path=run_request.input_path,
+            command=run_request.command,
+            out_dir=run_request.out_dir,
             parent=self,
         )
         self.worker.output.connect(self._append_log_line)
@@ -372,39 +432,38 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def _set_running(self, running: bool) -> None:
+        self.state.session.is_running = running
         widgets = (
-            self.batch_spin,
-            self.threshold_spin,
-            self.min_area_spin,
-            self.radius_spin,
-            self.px_per_micron_spin,
-            self.save_overlays_check,
-            self.excel_check,
-            self.open_folder_btn,
-            self.browse_out_btn,
+            self.open_folder_action,
+            self.open_image_action,
+            self.select_output_action,
+            self.settings_action,
         )
         for widget in widgets:
             widget.setEnabled(not running)
+        self.run_action.setEnabled(not running)
         if running:
             self.input_list.setEnabled(False)
-            self.prev_image_btn.setEnabled(False)
-            self.next_image_btn.setEnabled(False)
-            self.status_label.setText("Processing images. Progress details will appear in the log tab.")
+            self.previous_image_action.setEnabled(False)
+            self.next_image_action.setEnabled(False)
         else:
-            self.input_list.setEnabled(bool(self._input_images))
+            self.open_folder_action.setEnabled(True)
+            self.open_image_action.setEnabled(True)
+            self.input_list.setEnabled(bool(self.state.session.input_images))
             self._update_navigation_buttons()
-            if self.last_out_dir is not None and self.last_out_dir.exists():
-                self.status_label.setText(f"Ready. Latest results are available in:\n{self.last_out_dir}")
-            else:
-                self.status_label.setText("Select an input folder and output location, then run the pipeline.")
-        self.run_btn.setEnabled(not running)
-        self.progress_bar.setVisible(running)
-        self.open_output_btn.setEnabled((not running) and self.last_out_dir is not None and self.last_out_dir.exists())
+        self.open_output_action.setEnabled(
+            (not running)
+            and self.state.session.last_out_dir is not None
+            and self.state.session.last_out_dir.exists()
+        )
 
     @Slot()
     def _cleanup_worker(self) -> None:
         self._set_running(False)
         self.worker = None
+        if self._pending_temp_input_dir is not None:
+            shutil.rmtree(self._pending_temp_input_dir, ignore_errors=True)
+            self._pending_temp_input_dir = None
 
     @Slot(str)
     def _append_log_line(self, line: str) -> None:
@@ -412,14 +471,16 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def on_run_succeeded(self, result: BatchRunResult) -> None:
+        self.state.session.last_result = result
+        self.controller.set_last_out_dir(Path(result.out_dir))
         self._append_log_line("Finished successfully.")
         self._populate_summary(result.summary_rows, result.stats_rows)
         self._populate_droplets(result.droplet_rows)
-        self._load_overlay_gallery(Path(result.out_dir))
-        self._load_result_previews(Path(result.out_dir))
-        self.status_label.setText(f"Processing complete. Results saved to:\n{result.out_dir}")
+        self._load_result_images(Path(result.out_dir))
+        self._load_result_previews()
+        self._set_workflow_step(WORKFLOW_STEP_QUANTIFY)
 
-        self.open_output_btn.setEnabled(True)
+        self.open_output_action.setEnabled(True)
         self.tabs.setCurrentWidget(self.summary_tab)
         self.raise_()
         self.activateWindow()
@@ -428,22 +489,21 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def on_run_failed(self, message: str) -> None:
         self.log_output.appendPlainText("ERROR: " + message)
-        self.status_label.setText("Run failed. Check the log tab for details and adjust the settings if needed.")
+        self._set_workflow_step(WORKFLOW_STEP_SEGMENT)
         QMessageBox.critical(self, "Error", message)
 
     def _clear_tables_and_outputs(self) -> None:
+        self.controller.clear_results()
         self._reset_table(self.summary_table)
         self._reset_table(self.stats_table)
         self._reset_table(self.droplets_table)
         self.summary_message.setText("Run the pipeline to see summary tables.")
-        self.overlay_list.clear()
-        self.overlay_list.setEnabled(False)
-        self.overlay_image_label.setPixmap(QPixmap())
-        self.overlay_image_label.setText("Overlay gallery will appear here after a successful run.")
-        self._overlay_paths = []
-        self.mask_panel.clear_to_title("Segmentation result")
-        self.overlay_panel.clear_to_title("Overlay")
+        self.controller.set_overlay_paths([])
+        self.preview_service.clear_preview_cache()
+        self.viewer.clear("Select an image to inspect.")
+        self._set_workflow_step(WORKFLOW_STEP_LOAD)
         self._update_navigation_buttons()
+        self._refresh_tiff_mode_label()
 
     def _populate_summary(self, summary_rows: list[dict[str, str]], stats_rows: list[dict[str, str]]) -> None:
         if summary_rows:
@@ -464,56 +524,25 @@ class MainWindow(QMainWindow):
         headers = list(droplet_rows[0].keys())
         self._populate_table(self.droplets_table, headers, droplet_rows)
 
-    def _refresh_status_label(self) -> None:
-        folder_text = self.folder_path if self.folder_path else "No folder selected"
-        output_text = self.out_dir_path if self.out_dir_path else "No output folder selected"
-        self.status_label.setText(f"Folder: {folder_text}\nOutput: {output_text}")
-
-    def _load_overlay_gallery(self, out_dir: Path) -> None:
-        overlay_dir = out_dir / "overlays"
-        overlay_files = sorted([p for p in overlay_dir.glob("*") if p.suffix.lower() in VALID_EXTS]) if overlay_dir.exists() else []
-
-        self.overlay_list.clear()
-        self._overlay_paths = overlay_files
-        if not self._overlay_paths:
-            self.overlay_list.setEnabled(False)
-            self.overlay_image_label.setPixmap(QPixmap())
-            self.overlay_image_label.setText("No overlay images were generated.")
-            return
-
-        self.overlay_list.setEnabled(True)
-        for path in self._overlay_paths:
-            self.overlay_list.addItem(path.name)
-        self.overlay_list.setCurrentRow(0)
-
-    @Slot(int)
-    def on_overlay_selected(self, index: int) -> None:
-        if index < 0 or index >= len(self._overlay_paths):
-            return
-        path = self._overlay_paths[index]
-        pixmap = image_file_to_qpixmap(path)
-        if pixmap.isNull():
-            self.overlay_image_label.setPixmap(QPixmap())
-            self.overlay_image_label.setText(f"Could not load overlay: {path.name}")
-            return
-        self.overlay_image_label.setText("")
-        self.overlay_image_label.setPixmap(pixmap)
-        self.overlay_panel.set_scaled_pixmap(pixmap)
-        self._show_related_images_for_overlay(path)
+    def _load_result_images(self, out_dir: Path) -> None:
+        overlay_paths = self.preview_service.load_overlay_paths(out_dir)
+        self.controller.set_overlay_paths(overlay_paths)
 
     @Slot(int)
     def on_input_selected(self, index: int) -> None:
-        if index < 0 or index >= len(self._input_images):
-            self.original_panel.clear_to_title("Original preview")
-            self.mask_panel.clear_to_title("Segmentation result")
-            self.overlay_panel.clear_to_title("Overlay")
+        self.state.viewer.current_input_index = index
+        if index < 0 or index >= len(self.state.session.input_images):
+            self.viewer.clear("Select an image to inspect.")
             self._update_navigation_buttons()
             return
 
-        current_path = self._input_images[index]
-        self._show_input_preview(current_path)
-        self._show_outputs_for_stem(current_path.stem)
+        self.state.viewer.current_slice_index = 0
+        self.state.viewer.stack_view_mode = STACK_VIEW_SLICE
+        self.preview_service.clear_preview_cache()
+        self._refresh_viewer()
+        self._set_workflow_step(WORKFLOW_STEP_PREVIEW)
         self._update_navigation_buttons()
+        self._refresh_tiff_mode_label()
 
     def show_previous_image(self) -> None:
         current = self.input_list.currentRow()
@@ -522,119 +551,96 @@ class MainWindow(QMainWindow):
 
     def show_next_image(self) -> None:
         current = self.input_list.currentRow()
-        if current < len(self._input_images) - 1:
+        if current < len(self.state.session.input_images) - 1:
             self.input_list.setCurrentRow(current + 1)
 
     def _populate_input_list(self) -> None:
         self.input_list.blockSignals(True)
         self.input_list.clear()
-        for path in self._input_images:
+        for path in self.state.session.input_images:
             self.input_list.addItem(path.name)
-        self.input_list.setEnabled(bool(self._input_images))
+        self.input_list.setEnabled(bool(self.state.session.input_images))
         self.input_list.blockSignals(False)
         self._update_navigation_buttons()
 
     def _update_navigation_buttons(self) -> None:
-        has_images = bool(self._input_images) and self.input_list.isEnabled()
+        has_images = bool(self.state.session.input_images) and self.input_list.isEnabled()
         current = self.input_list.currentRow()
-        self.prev_image_btn.setEnabled(has_images and current > 0)
-        self.next_image_btn.setEnabled(has_images and 0 <= current < len(self._input_images) - 1)
+        self.previous_image_action.setEnabled(has_images and current > 0)
+        self.next_image_action.setEnabled(has_images and 0 <= current < len(self.state.session.input_images) - 1)
 
-    def _show_input_preview(self, path: Path) -> None:
-        try:
-            bundle = load_preview_bundle(str(path))
-            pixmap = numpy_image_to_qpixmap(bundle.display_image)
-        except Exception:
-            pixmap = QPixmap()
-
-        if pixmap.isNull():
-            self.original_panel.clear_to_title(f"Could not load preview:\n{path.name}")
-            return
-        self.original_panel.set_scaled_pixmap(pixmap)
-
-    def _load_result_previews(self, out_dir: Path) -> None:
+    def _load_result_previews(self) -> None:
         current_index = self.input_list.currentRow()
-        if 0 <= current_index < len(self._input_images):
-            self._show_outputs_for_stem(self._input_images[current_index].stem)
+        if 0 <= current_index < len(self.state.session.input_images):
+            if self.state.settings.tiff_stack_mode == TIFF_MODE_MAX_PROJECTION:
+                self.state.viewer.stack_view_mode = STACK_VIEW_PROJECTION
+            else:
+                self.state.viewer.stack_view_mode = STACK_VIEW_SLICE
+            self._refresh_viewer()
             return
 
-        overlay_path = self._first_image_in_dir(out_dir / "overlays")
+        overlay_path = self.preview_service.first_overlay_path_from_paths(self.state.session.overlay_paths)
         if overlay_path is not None:
-            self._show_related_images_for_overlay(overlay_path)
-            return
-
-        self.mask_panel.clear_to_title("Segmentation result")
-        self.overlay_panel.clear_to_title("Overlay")
-
-    def _show_related_images_for_overlay(self, overlay_path: Path) -> None:
-        stem = overlay_path.stem.removesuffix("_overlay")
-        input_match = self._find_input_image(stem)
-        if input_match is not None:
-            row = self._input_images.index(input_match)
-            if self.input_list.currentRow() != row:
-                self.input_list.setCurrentRow(row)
+            result_stem = overlay_path.stem.removesuffix("_overlay")
+            selection = self.preview_service.get_preview_bundle(
+                viewer_state=self.state.viewer,
+                input_images=self.state.session.input_images,
+                stem=result_stem,
+                last_out_dir=self.state.session.last_out_dir,
+            )
+            matched_index = self.preview_service.find_input_index_by_stem(
+                selection.normalized_stem,
+                self.state.session.input_images,
+            )
+            if matched_index is not None:
+                if selection.matched_slice_index is not None:
+                    self.state.viewer.current_slice_index = selection.matched_slice_index
+                    self.state.viewer.stack_view_mode = STACK_VIEW_SLICE
+                if selection.is_projection_result:
+                    self.state.viewer.stack_view_mode = STACK_VIEW_PROJECTION
+                self.state.viewer.current_mode = VIEWER_MODE_OVERLAY
+                self.input_list.setCurrentRow(matched_index)
                 return
 
-        self._show_outputs_for_stem(stem)
+            display = self.preview_service.prepare_display_for_stem(
+                viewer_state=self.state.viewer,
+                input_images=self.state.session.input_images,
+                stem=selection.normalized_stem,
+                last_out_dir=self.state.session.last_out_dir,
+                preferred_mode=VIEWER_MODE_OVERLAY,
+            )
+            self._apply_viewer_display(display)
+            return
 
-    def _show_outputs_for_stem(self, stem: str) -> None:
-        mask_path = self._output_image_path("predicted_masks", stem, "_pred.png")
-        overlay_path = self._output_image_path("overlays", stem, "_overlay.png")
+        self.viewer.clear("Select an image to inspect.")
 
-        if mask_path is None:
-            self.mask_panel.clear_to_title("Segmentation result")
-        else:
-            mask_pixmap = image_file_to_qpixmap(mask_path)
-            if mask_pixmap.isNull():
-                self.mask_panel.clear_to_title(f"Could not load mask:\n{mask_path.name}")
-            else:
-                self.mask_panel.set_scaled_pixmap(mask_pixmap)
+    def _refresh_viewer(self) -> None:
+        display = self.preview_service.prepare_display_for_input(
+            viewer_state=self.state.viewer,
+            input_images=self.state.session.input_images,
+            current_index=self.input_list.currentRow(),
+            last_out_dir=self.state.session.last_out_dir,
+        )
+        if display is None:
+            self.viewer.clear("Select an image to inspect.")
+            self._refresh_tiff_mode_label()
+            return
+        self._apply_viewer_display(display)
 
-        if overlay_path is None:
-            self.overlay_panel.clear_to_title("Overlay")
-        else:
-            overlay_pixmap = image_file_to_qpixmap(overlay_path)
-            if overlay_pixmap.isNull():
-                self.overlay_panel.clear_to_title(f"Could not load overlay:\n{overlay_path.name}")
-            else:
-                self.overlay_panel.set_scaled_pixmap(overlay_pixmap)
-                self.overlay_image_label.setText("")
-                self.overlay_image_label.setPixmap(overlay_pixmap)
-            overlay_index = self._overlay_index_for_path(overlay_path)
-            if overlay_index is not None and self.overlay_list.currentRow() != overlay_index:
-                self.overlay_list.blockSignals(True)
-                self.overlay_list.setCurrentRow(overlay_index)
-                self.overlay_list.blockSignals(False)
-
-    def _find_input_image(self, stem: str) -> Path | None:
-        for path in self._input_images:
-            if path.stem == stem:
-                return path
-        return None
-
-    def _output_image_path(self, folder_name: str, stem: str, suffix: str) -> Path | None:
-        if self.last_out_dir is None:
-            return None
-
-        candidate = self.last_out_dir / folder_name / f"{stem}{suffix}"
-        if candidate.exists():
-            return candidate
-        return None
-
-    def _overlay_index_for_path(self, target: Path) -> int | None:
-        for index, path in enumerate(self._overlay_paths):
-            if path == target:
-                return index
-        return None
-
-    def _first_image_in_dir(self, directory: Path) -> Path | None:
-        if not directory.exists():
-            return None
-
-        images = sorted(p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in VALID_EXTS)
-        if not images:
-            return None
-        return images[0]
+    def _apply_viewer_display(self, display: ViewerDisplayData) -> None:
+        self.viewer.set_images(
+            original=display.original_pixmap,
+            mask=display.mask_pixmap,
+            overlay=display.overlay_pixmap,
+            source_mode=self.state.viewer.source_mode,
+            is_stack=self.state.viewer.is_stack,
+            available_slices=self.state.viewer.available_slices,
+            current_slice_index=self.state.viewer.current_slice_index,
+            stack_view_mode=self.state.viewer.stack_view_mode,
+        )
+        target_mode = display.preferred_mode or self.state.viewer.current_mode
+        self.viewer.set_mode(target_mode)
+        self._refresh_tiff_mode_label()
 
     def _reset_table(self, table: QTableWidget) -> None:
         table.clear()
@@ -654,6 +660,7 @@ class MainWindow(QMainWindow):
         table.resizeColumnsToContents()
 
     def open_output_folder(self) -> None:
-        if self.last_out_dir is None:
+        if self.state.session.last_out_dir is None:
             return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.last_out_dir)))
+        self._set_workflow_step(WORKFLOW_STEP_EXPORT)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.state.session.last_out_dir)))
